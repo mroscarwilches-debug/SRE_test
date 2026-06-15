@@ -1,0 +1,23 @@
+# Copia este archivo a terraform.tfvars y ajusta los valores si es necesario.
+# Los defaults en variables.tf ya son cost-optimized para este ejercicio.
+
+# aws_region   = "us-east-1"
+# project_name = "sre-test"
+
+# vpc_cidr             = "10.0.0.0/16"
+# public_subnet_cidrs  = ["10.0.0.0/24", "10.0.1.0/24"]
+# private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
+# redis_node_type     = "cache.t3.micro"
+# redis_engine_version = "7.1"
+
+# lambda_runtime     = "python3.12"
+# lambda_timeout     = 10
+# lambda_memory_size = 128
+
+# cache_ttl_seconds = 60
+
+# api_throttling_rate_limit  = 10
+# api_throttling_burst_limit = 20
+
+# log_retention_days = 7

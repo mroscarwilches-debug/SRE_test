@@ -235,6 +235,5 @@ test_sre/
 ├── scripts/
 │   ├── build_layer.sh           # construye la Lambda Layer con Docker
 │   └── test_cache.sh            # prueba MISS -> HIT
-├── evidence/                     # evidencia de una corrida real (MISS, HIT, S3)
-└── terraform.tfvars.example     # ejemplo de variables
+└── evidence/                     # evidencia de una corrida real (MISS, HIT, S3)
 ```

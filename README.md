@@ -16,45 +16,42 @@ Cuando alguien llama a `POST /process` con un body JSON, la Lambda hace esto:
 
 ![Arquitectura](./docs/StructureProjectVF.png)
 
-En palabras simples, así se conectan las piezas:
+Descripción:
 
-- Todo vive dentro de una **VPC** (una red privada propia dentro de AWS), con 2 subredes públicas y 2 privadas, repartidas en 2 zonas de disponibilidad (para no depender de un solo "edificio" de AWS).
+- Todo se desarrolla dentro de una **VPC**, con 2 subredes públicas y 2 privadas, repartidas en 2 zonas de disponibilidad (para no depender de un solo building de AWS).
 - **API Gateway** recibe las peticiones HTTP desde internet y se las pasa a la Lambda.
-- La **Lambda** vive en las subredes privadas — no tiene IP pública. Para salir hacia afuera usa:
+- La **Lambda** se aloja en subredes privadas — no tiene IP pública. Para salir usa:
   - Un **NAT Gateway** (en una subred pública), para internet en general.
   - Un **VPC Endpoint**, para hablar con S3 directo, sin pasar por internet.
-- **ElastiCache (Redis)** también vive en las subredes privadas. Solo la Lambda puede conectarse a él, y solo por el puerto 6379.
-- **S3** guarda los resultados procesados. Solo la Lambda puede escribir ahí.
+- **ElastiCache (Redis)** alojada en subredes privadas. Solo Lambda puede conectarse a él por el puerto 6379.
+- **S3** guarda los resultados procesados. Solo Lambda puede escribir ahí.
 
 ## Flujo paso a paso
 
-1. El cliente hace `POST /process` con un body JSON.
-2. API Gateway recibe la petición y se la pasa a la Lambda casi sin tocarla (esto se llama integración "proxy").
-3. La Lambda calcula la clave de caché y le pregunta a Redis si ya tiene una respuesta guardada (`GET`).
-   - **Si Redis responde algo (HIT)**: la Lambda devuelve ese resultado tal cual, con el header `X-Cache: HIT`.
-   - **Si Redis no tiene nada (MISS)**: la Lambda
+1. El cliente hace `POST /process` con un body JSON (elijo PostMan por facilidad).
+2. API Gateway recibe la petición y se la pasa a Lambda (integración proxy).
+3. Lambda calcula la clave de caché y pregunta a Redis si ya tiene una respuesta guardada (`GET`).
+   - **Si Redis responde algo (HIT)**: lambda devuelve ese resultado tal cual, con el header `X-Cache: HIT`.
+   - **Si Redis no tiene nada (MISS)**: Lambda,
      1. procesa el contenido (hash SHA-256 + el texto al revés),
      2. guarda ese resultado en S3, en `results/<fecha>/<id>.json`,
      3. lo guarda también en Redis, con una caducidad (`TTL`) de 60 segundos,
      4. y responde con el resultado y el header `X-Cache: MISS`.
 4. Si algo falla en cualquier paso (Redis no contesta, error al guardar en S3, etc.), la Lambda registra el error en CloudWatch y responde con un HTTP 500 y un mensaje describiendo el problema.
 
-## Decisiones técnicas
+## Decisiones técnicas del proyecto
 
-### API Gateway: HTTP API en vez de REST API
+### API Gateway: HTTP API
 
 API Gateway ofrece dos tipos de API: **HTTP API** (más nueva y simple) y **REST API** (más vieja, con más opciones). Elegí **HTTP API** debido a que:
 
 - Cuesta hasta ~70% menos que REST API para el mismo tráfico.
 - Responde más rápido.
-- El CORS (dejar que páginas de otros dominios llamen a esta API) se
-  configura con unas pocas líneas, sin crear a mano el método `OPTIONS`.
-- El "formato" del request que recibe la Lambda es más simple
+- El CORS se configura con unas pocas líneas, sin crear a mano el método `OPTIONS`.
+- El formato del request que recibe la Lambda es más simple
   (`payload_format_version = "2.0"`).
 
-¿Cuándo usaría REST API? Si necesitara API Keys con límites de uso por
-cliente, validar el formato del JSON antes de que llegue a la Lambda, o
-conectarme directo a un balanceador interno — nada de eso aplica aquí.
+Usaría REST API ante una necesidad de API Keys con límites de uso por cliente, validar el formato del JSON antes de que llegue a la Lambda, o conectarme directo a un balanceador interno.
 
 ### Límite de tráfico (throttling) en API Gateway
 
@@ -63,46 +60,39 @@ Para que nadie (por error o a propósito) sature la API con miles de peticiones 
 - **Rate limit = 10 requests/segundo** en promedio.
 - **Burst limit = 20**: picos cortos por encima del promedio que se toleran.
 
-Si se supera, API Gateway responde `429 Too Many Requests` sin llegar a invocar la Lambda. Son valores bajos a propósito: este es un ejercicio de prueba, no un servicio con tráfico real, y así se protege tanto el costo (menos invocaciones de Lambda) como a Redis (un solo nodo, sin réplicas) de quedarse sin recursos.
+Si se supera, API Gateway responde `429 Too Many Requests` sin llegar a invocar la Lambda. Son valores bajos a propósito: debido a que es un proyecto de prueba no un proyecto con tráfico real,se protege el costo (menos invocaciones de Lambda) como a Redis (un solo nodo, sin réplicas) de quedarse sin recursos.
 
 ### Un solo NAT Gateway
 
-Un **NAT Gateway** es lo que le permite a algo en una subred privada (sin IP pública, como esta Lambda) salir a internet.
+Un **NAT Gateway** es lo que le permite a los servicios en una subred privada (sin IP pública, como Lambda) salir a internet.
 
-Lo ideal en producción es tener **un NAT Gateway por zona de disponibilidad**
-(2 en este caso), para que si una zona falla, la otra siga funcionando. Aquí usé **solo 1** para ahorrar costo: cada NAT Gateway cuesta ~$0.045 por hora, las 24 horas, esté en uso o no.
+En producción se deberia tener **un NAT Gateway por zona de disponibilidad**
+(2 en este caso), debido a que que si una zona falla, la otra siga funcionando. En este propyecto se usa solo 1 para ahorrar costo: cada NAT Gateway cuesta ~$0.045 por hora, las 24 horas, esté en uso o no.
 
-> El flujo principal de este ejercicio (Redis y S3) **no depende del NAT**. Redis está en la misma red (VPC) y S3 se alcanza por el VPC Endpoint, sin pasar por internet. El NAT solo está para cumplir el requisito de "la Lambda puede salir a internet si lo necesita".
+> El flujo principal de este ejercicio (Redis y S3) **no depende del NAT**. Redis está en la misma red (VPC) y S3 se alcanza por el VPC Endpoint, sin pasar por internet.
 
 ### ElastiCache: un solo nodo, sin réplicas
 
-Para Redis usé un solo nodo `cache.t3.micro`, sin réplicas ni Multi-AZ (es decir, sin copias del nodo en otra zona de disponibilidad). Si ese nodo falla, se pierde la caché — pero como solo es una caché (no datos importantes), no pasa nada grave.
+Para Redis se usa un solo nodo `cache.t3.micro`, sin réplicas ni Multi-AZ (copias del nodo en otra zona de disponibilidad). Si ese nodo falla, se pierde la caché — pero como solo es una caché (no datos importantes), no pasa nada grave.
 
-En producción se usaría un `replication_group` con al menos 2 nodos en zonas distintas y `automatic_failover_enabled = true`, para que si un nodo se cae, otro tome su lugar automáticamente. Eso duplica el costo, así que para esta prueba no tiene sentido.
+En producción se debe usar un `replication_group` con al menos 2 nodos en zonas distintas y `automatic_failover_enabled = true`, para que si un nodo se cae, otro tome su lugar automáticamente. Sin emnbargo se deben tener en cuenta costos.
 
 ### Cliente de Redis: `redis-py`, empaquetado con Docker
 
 Para hablar con Redis desde Python, lo normal es usar la librería `redis-py` (`pip install redis`). El problema: Lambda **no trae instaladas las librerías externas de Python** — solo trae `boto3` (el SDK de AWS).
 
-La solución de AWS para esto se llama **Lambda Layer**: una carpeta con
-librerías que se "conecta" a la función, como un plugin.
+Para solucionar este inconveniente se usa **Lambda Layer**: una carpeta con librerías que se conecta a la función, como un plugin. Sin embargo Lambda corre en Linux, pero el desarrollo es en Windows, y algunas librerías de Python se compilan distinto según el sistema operativo. Para que la librería sea compatible se debe construir dentro de un contenedor Docker que imita el entorno de Lambda (`scripts/build_layer.sh`, con la imagen oficial `public.ecr.aws/sam/build-python3.12`).
 
-Para armar esa carpeta hay un detalle: Lambda corre en Linux, pero el
-desarrollo es en Windows, y algunas librerías de Python se compilan distinto según el sistema operativo. Para que la librería sea compatible, la instalo **dentro de un contenedor Docker que imita el entorno de Lambda**
-(`scripts/build_layer.sh`, con la imagen oficial
-`public.ecr.aws/sam/build-python3.12`).
-
-En resumen:
+En conclusión:
 
 - `layer/requirements.txt` dice qué instalar (`redis==5.0.8`).
 - `scripts/build_layer.sh` lo instala dentro de Docker, en `layer/python/`.
 - Terraform empaqueta esa carpeta como una Lambda Layer y la conecta a la función.
-- **`terraform apply` corre `scripts/build_layer.sh` automáticamente** (vía un
-  `null_resource` con `local-exec`), solo si cambió `requirements.txt`. Así no
-  hace falta ningún paso manual antes de aplicar — el único requisito es tener
-  **Docker corriendo**.
+- **`terraform apply` corre `scripts/build_layer.sh` automáticamente** (vía un  `null_resource` con `local-exec`), solo si cambió `requirements.txt`. 
+**NOTA: El único requisito es tener Docker ejecutandose**.
 
-Un detalle de rendimiento: el cliente de Redis se crea **una sola vez, fuera de la función `lambda_handler`**. Así, si Lambda reutiliza el mismo "entorno" para varias peticiones seguidas (una invocación "warm"), no hace falta reconectarse a Redis cada vez.
+
+**Nota de rendimiento** el cliente de Redis se crea **una sola vez, fuera de la función `lambda_handler`**. De esta forma si Lambda reutiliza el mismo entorno para varias peticiones seguidas (una invocación "warm"), no hace falta reconectarse a Redis cada vez.
 
 ### El código de la Lambda se empaqueta solo
 
@@ -110,47 +100,47 @@ Un detalle de rendimiento: el cliente de Redis se crea **una sola vez, fuera de 
 
 ### Permisos mínimos (IAM)
 
-La idea de "mínimo privilegio" es darle a cada cosa solo los permisos que necesita, ni uno más. El rol de la Lambda tiene:
+Cuando hablamos de "mínimo privilegio" es darle a cada cosa solo los permisos que necesita, hace parte de las correctas formas de seguridad. El rol de la Lambda tiene:
 
 - Un permiso de AWS para manejar conexiones de red dentro de la VPC y para escribir logs en CloudWatch (`AWSLambdaVPCAccessExecutionRole`) — esto es obligatorio para que una Lambda corra dentro de una VPC.
-- Un permiso extra, hecho a mano, que solo deja `s3:PutObject` (escribir) sobre `results/*` del bucket. Nada de leer, borrar, ni tocar otra carpeta.
+- Un permiso extra, hecho a mano, que solo deja `s3:PutObject` (escribir) sobre `results/*` del bucket. Nunca leer, borrar, ni tocar otra carpeta.
 
-¿Por qué no `s3:GetObject`? Porque en un HIT, la respuesta viene de Redis, no de S3 — la Lambda nunca necesita *leer* el bucket.
+NO se utiliza `s3:GetObject`en este caso porque en un HIT, la respuesta viene de Redis, no de S3 — la Lambda nunca necesita *leer* el bucket.
 
 ### Security Groups
 
-Un **Security Group** es básicamente una lista de reglas de "quién puede hablar con quién" en la red.
+Un **Security Group** es la lista de reglas de "quién puede hablar con quién" en la red.
 
 - El **SG de la Lambda** solo permite salida (egress) por dos puertos: `6379` hacia el SG de Redis, y `443` (HTTPS) hacia `0.0.0.0/0` — necesario para hablar con S3 vía el VPC Endpoint, con CloudWatch Logs, y para salir a internet por el NAT si hiciera falta.
-- El **SG de Redis** no acepta nada por defecto. La única regla que tiene dice *"acepta conexiones en el puerto 6379, pero solo si vienen del SG de la Lambda"*. Así, ningún otro recurso de la cuenta puede conectarse a Redis, ni por accidente.
+- El **SG de Redis** no acepta nada por defecto. La única regla que tiene *"acepta conexiones en el puerto 6379, pero solo si vienen del SG de la Lambda"*. De otra forma ningún otro recurso de la cuenta puede nunca conectarse a Redis.
 
 ### Bucket de S3
 
 - **`force_destroy = true`**: permite borrar el bucket con `terraform destroy` aunque tenga archivos adentro (sin esto, Terraform se niega a borrar un bucket que no está vacío).
 - **Versionado activado**: si se sobrescribe un archivo, AWS guarda también la versión anterior.
-- **Bloqueo de acceso público (las 4 opciones)**: nadie fuera de la cuenta puede acceder al bucket, ni por accidente.
+- **Bloqueo de acceso público (las 4 opciones)**: nadie fuera de la cuenta puede acceder al bucket.
 - **Cifrado por defecto (SSE-S3/AES256)**: es gratis y buena práctica tenerlo siempre activado.
-- **Política del bucket**: solo el rol de la Lambda puede escribir
-  (`s3:PutObject`) dentro de `results/*`.
-
+- **Política del bucket**: solo el rol de la Lambda puede escribir (`s3:PutObject`) dentro de `results/*`.
+ 
 ### Servicios adicionales: IAM y CloudWatch Logs
 
-Además de los 5 servicios núcleo (VPC, API Gateway, Lambda, ElastiCache y S3), el proyecto usa dos servicios más de AWS:
+Además de los 5 servicios núcleo (VPC, API Gateway, Lambda, ElastiCache y S3), en el proyecto se usan dos servicios más de AWS:
 
-- **IAM (roles y políticas)**: la Lambda necesita un rol propio para poder ejecutarse y hablar con Redis, S3 y CloudWatch. Ya se explicó arriba, en "Permisos mínimos (IAM)", qué permisos tiene exactamente y por qué.
-- **CloudWatch Logs**: tanto la Lambda como API Gateway escriben sus logs ahí automáticamente (no hay que programar nada extra). Es la forma más simple de ver qué pasó en cada request, incluyendo errores. Se configuró una retención de 7 días para no acumular logs para siempre.
+- **IAM (roles y políticas)**: Lambda necesita un rol propio para poder ejecutarse y hablar con Redis, S3 y CloudWatch.
+- **CloudWatch Logs**: tanto la Lambda como API Gateway escriben sus logs automáticamente (no hay que programar nada extra). Es la forma más simple de ver qué pasa en cada request, incluyendo errores. Se configuró una retención de 7 días para no acumular logs para siempre.
 
-No se agregaron otros servicios (Secrets Manager, SQS, SNS, Parameter Store, etc.) porque este ejercicio no maneja secretos propios ni necesita colas o notificaciones — agregarlos sería complejidad sin un caso de uso real detrás.
+No se agregaron otros servicios (Secrets Manager, SQS, SNS, Parameter Store, etc.) porque este ejercicio no maneja secretos propios ni necesita colas o notificaciones.
 
 ## Pre-requisitos
 
 Para desplegar este proyecto desde cero:
 
 - **Terraform** >= 1.5
-- **AWS CLI** instalado y configurado con credenciales válidas (`aws configure`). El usuario necesita permisos para crear: VPC, subnets, Internet Gateway, NAT Gateway, VPC Endpoints, Security Groups, ElastiCache, Lambda (funciones y layers), roles/políticas IAM, API Gateway (HTTP API), buckets S3 y Log Groups de CloudWatch. Para este ejercicio, lo más simple es usar un usuario con la política administrada `AdministratorAccess`.
-- **Docker Desktop** corriendo (se usa para construir la Lambda Layer de `redis-py` con el mismo sistema operativo que usa Lambda).
+- **AWS CLI** instalado y configurado con credenciales válidas (`aws configure`). El usuario necesita permisos para crear: VPC, subnets, Internet Gateway, NAT Gateway, VPC Endpoints, Security Groups, ElastiCache, Lambda (funciones y layers), roles/políticas IAM, API Gateway (HTTP API), buckets S3 y Log Groups de CloudWatch. 
+Para este ejercicio, lo más simple es usar un usuario con la política administrada `AdministratorAccess`.
+- **Docker Desktop** ejecutandose (se usa para construir la Lambda Layer de `redis-py` con el mismo sistema operativo que usa Lambda).
 - **Bash** para correr los scripts (`scripts/build_layer.sh`, `scripts/test_cache.sh`). En Windows uso **Git Bash**.
-- **curl**, para probar el endpoint (incluido en Git Bash y en macOS/Linux).
+- **Curl, Postman**, para probar el endpoint (incluido en Git Bash y en macOS/Linux).
 
 ## Cómo desplegar
 
@@ -162,15 +152,13 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
-`terraform apply` construye automáticamente la Lambda Layer de `redis-py` con
-Docker (ver sección de decisiones técnicas) — solo asegúrate de tener **Docker
-Desktop corriendo** antes de aplicar.
+`terraform apply` construye automáticamente la Lambda Layer de `redis-py` con Docker — asegurarnos de tener **Docker Desktop ejecutandose** antes de aplicar.
 
 Crear ElastiCache puede tardar varios minutos.
 
 ## Pruebas y evidencia obligatoria (MISS → HIT)
 
-### Probar manualmente con curl
+### Probar manualmente con curl en GitBash
 
 ```bash
 API_URL=$(terraform output -raw api_endpoint)

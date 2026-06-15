@@ -14,7 +14,7 @@ Cuando alguien llama a `POST /process` con un body JSON, la Lambda hace esto:
 
 ## Arquitectura
 
-![Arquitectura](./docs/StructureProject.png)
+![Arquitectura](./docs/StructureProjectVF.png)
 
 En palabras simples, así se conectan las piezas:
 
@@ -216,7 +216,7 @@ El script manda **dos peticiones POST /process idénticas** y revisa:
 test_sre/
 ├── README.md              # este archivo
 ├── docs/
-│   └── StructureProject.png # diagrama de arquitectura
+│   └── StructureProjectVF.png # diagrama de arquitectura
 ├── versions.tf             # providers de Terraform (aws, archive, null)
 ├── variables.tf            # variables de entrada
 ├── network.tf              # VPC, subredes, NAT, rutas, VPC endpoint
